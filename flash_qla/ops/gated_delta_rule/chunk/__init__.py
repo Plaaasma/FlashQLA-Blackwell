@@ -138,6 +138,14 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         q_orig = q
         k_orig = k
 
+        # [BLACKWELL FIX] auto_cp's intra_card_cp_preprocess invokes the
+        # prepare_h kernel which asks for ~152 KiB shmem and busts GB10's
+        # 99 KiB budget at runtime (TVM throws "Failed to set the allowed
+        # dynamic shared memory size to 155648").  Disable auto_cp on
+        # SM_120/121; keep it on Hopper where it's a perf win.
+        _major, _ = torch.cuda.get_device_capability(q.device if q.is_cuda else 0)
+        _auto_cp = _major < 10
+
         g, A, o, _, final_state = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
@@ -149,6 +157,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             output_final_state=output_final_state,
             output_h=False,
             cu_seqlens=cu_seqlens,
+            auto_cp=_auto_cp,
         )
 
         ctx.save_for_backward(q_orig, k_orig, v, g, beta, A, initial_state, cu_seqlens)

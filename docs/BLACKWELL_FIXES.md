@@ -62,24 +62,45 @@ iteration, so single-buffering them races).
 **File:** `flash_qla/ops/gated_delta_rule/chunk/__init__.py`
 
 The "auto context-parallelism" preprocessing path calls a `prepare_h` kernel
-that allocates >100 KiB of shmem. That kernel doesn't fit on Blackwell
-consumer.
+that asks for ~152 KiB of shared memory. GB10 only has 99 KiB. On Blackwell
+this surfaces at runtime as:
 
-**Fix:** added an `auto_cp=False` branch that skips that path entirely:
-
-```python
-if auto_cp:
-    initial_state, cu_seqlens, cp_seq_map, raw_cu_seqlens = (
-        intra_card_cp_preprocess(...)
-    )
-else:
-    cp_seq_map = None
-    raw_cu_seqlens = None
+```
+tvm.error.InternalError: Failed to set the allowed dynamic shared
+memory size to 155648
 ```
 
-vLLM doesn't use intra-card CP (it does its own batching), so this is
-free for the vLLM integration. Standalone callers that *want* CP on Blackwell
-will need to either (a) re-tune `prepare_h` for 99 KiB or (b) live without it.
+**Fix (two parts):**
+
+1. Added an `auto_cp=False` branch in `chunk_gated_delta_rule_fwd` that skips
+   the CP preprocessing call entirely:
+
+   ```python
+   if auto_cp:
+       initial_state, cu_seqlens, cp_seq_map, raw_cu_seqlens = (
+           intra_card_cp_preprocess(...)
+       )
+   else:
+       cp_seq_map = None
+       raw_cu_seqlens = None
+   ```
+
+2. The user-facing wrapper (`ChunkGatedDeltaRuleFunction.forward`) now
+   detects compute capability and passes `auto_cp=False` on Blackwell:
+
+   ```python
+   _major, _ = torch.cuda.get_device_capability(q.device if q.is_cuda else 0)
+   _auto_cp = _major < 10
+   chunk_gated_delta_rule_fwd(..., auto_cp=_auto_cp)
+   ```
+
+   Without (2), short prompts work but long prompts (≳13K tokens in our
+   case) trigger a partition path that goes through `prepare_h` and crashes.
+
+vLLM doesn't use intra-card CP (it does its own batching), so disabling this
+on Blackwell is free for the vLLM integration. Hopper keeps it. Standalone
+Blackwell callers that *want* CP will need to either (a) re-tune `prepare_h`
+for 99 KiB or (b) live without it.
 
 ## 4. SM90 arch gate bypassed
 
