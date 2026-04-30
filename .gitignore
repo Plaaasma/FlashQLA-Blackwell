@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+.eggs/
+*.log
+.tilelang_cache/
+.vscode/
+.idea/
+.DS_Store

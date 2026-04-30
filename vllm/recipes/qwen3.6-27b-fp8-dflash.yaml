@@ -1,0 +1,80 @@
+# =====================================================================
+# Qwen3.6-27B-FP8 + DFlash speculative decoding + FlashQLA GDN kernel
+# =====================================================================
+#
+# Sample spark-vllm-docker recipe demonstrating the FlashQLA mod.  Strip
+# the parts you don't need (DFlash, prefix-caching, etc.) — the only piece
+# strictly required to enable FlashQLA is the `mods: - mods/flashqla` line.
+#
+# Stack:
+#   - Target:  Qwen3.6-27B-FP8 weights, bf16 compute.
+#   - Draft:   z-lab Qwen3.6-27B DFlash drafter (optional; remove the
+#              --speculative-config line to disable).
+#   - Spec:    "dflash" chain-style; num_speculative_tokens=15.
+#   - Backend: TREE_ATTN (required for DFlash's non-causal draft attention).
+#   - GDN:     FlashQLA TileLang fwd kernel (this mod).
+#
+# Sizing on GB10 (128 GB unified):
+#   - Target FP8 weights: ~29 GB.
+#   - Draft:               ~900 MB.
+#   - max_model_len=65536 + gpu_memory_utilization=0.75 → ~91 GB pool,
+#     leaves ~30 GB system headroom for the desktop, TileLang JIT, and
+#     anything else you might run concurrently.  Bump back to 262144 /
+#     0.85 if you need long context AND aren't running anything else.
+#     Drop max_num_seqs if KV pressure causes preemption.
+
+recipe_version: "1"
+name: Qwen3.6-27B-FP8-DFlash
+description: FP8 + DFlash spec decode + FlashQLA GDN, 64K ctx, bf16 KV
+solo_only: true
+container: vllm-node-tf5
+
+mods:
+  # FlashQLA TileLang GDN prefill kernel — replaces FLA Triton on the
+  # linear_attention layers with the Qwen team's fused fwd kernel.
+  # Speedups vs FLA Triton at B=1, T=32768 on GB10 (Stage A test):
+  #   - Hv=64 (closest to this model's num_v_heads=48): 2.76x total fwd
+  #   - Hv=4  (small-shape probe):                       1.73x total fwd
+  # End-to-end TTFT win is small (~3% on 8K prefill) because Qwen3.6-27B
+  # prefill is FA-dominated (16 full-attn layers + 64 MLPs alongside the
+  # 38 GDN layers); decode uses a separate Triton recurrent kernel that
+  # FlashQLA does NOT replace.  See the FlashQLA-Blackwell repo's
+  # docs/BENCHMARKS.md for details.
+  - mods/flashqla
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.75
+  max_model_len: 65536
+  max_num_batched_tokens: 16384
+  max_num_seqs: 8
+
+env:
+  HF_HUB_OFFLINE: "1"
+  VLLM_ATTENTION_BACKEND: "TREE_ATTN"
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  VLLM_DFLASH_BLOCK_L: "15"
+
+command: |
+  : > /tmp/vllm.log
+  exec > >(tee -a /tmp/vllm.log) 2>&1
+
+  exec python3 /vllm_compile_wrapper.py serve /models/qwen3.6-27b-fp8 \
+    --served-model-name qwen3.6-27b-fp8-dflash \
+    --host {host} \
+    --port {port} \
+    --dtype bfloat16 \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --load-format auto \
+    --trust-remote-code \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --enable-prefix-caching \
+    --speculative-config '{{"method":"dflash","model":"/models/dflash-zlab","num_speculative_tokens":15}}' \
+    -tp {tensor_parallel}
