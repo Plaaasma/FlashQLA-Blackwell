@@ -82,9 +82,26 @@ discussions, and r/LocalLLaMA Spark/GB10 threads (2026-Q1 to 2026-Q2).
 **The bandwidth ceiling.** Spark's GB10 has 273 GB/s LPDDR5X unified memory.
 Decode on a dense 27B FP8 model is bandwidth-bound — 27 GB / 273 GB/s ≈ **10
 tok/s** without speculation. Spec decoding multiplies this by mean-acceptance
-length: DFlash-15 averages ~3.0 mean accept length and lands at ~25 tok/s
-single-stream on this model. That is at or above the public state of the art
-for FP8-dense 27B on a single Spark.
+length: DFlash-15 with mean accept ~3.0 lands at ~25 tok/s single-stream
+when everything is healthy.
+
+**Caveat (real numbers as of 2026-04-30):** if you measure your own stack and
+get something closer to ~13-14 tok/s, you're probably hitting one of two
+known regressions:
+
+1. The z-lab DFlash drafter checkpoint published 2026-04-26 has lower
+   acceptance than the version that was around in mid-April (mean accept
+   3.03 → 2.61 measured). The drafter's own README warns: *"This model is
+   still under training, and inference engine support may not be fully
+   available yet due to architectural changes, including causal SWA layers."*
+   Pinning to an earlier HF revision recovers the gap if you can find one.
+2. vLLM dev builds in late April have a per-step overhead regression
+   (pure decode 6.55 tok/s on Qwen3.6-27B-FP8 vs 10 tok/s theoretical —
+   ~50ms overhead per step that wasn't there a week earlier). Affects
+   everything, not just spec decoding.
+
+Neither has a recipe-level fix. They're called out here so a user comparing
+to forum posts knows whether the gap is config or regression.
 
 **Constraint-safe knobs that are worth flipping** (each maybe +5-15%):
 
