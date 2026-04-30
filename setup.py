@@ -18,11 +18,18 @@ if not rev:
     except Exception:
         rev = ""
 
+_readme_path = os.path.join(this_dir, "README.md")
+try:
+    with open(_readme_path) as _f:
+        _long_description = _f.read()
+except FileNotFoundError:
+    _long_description = __doc__ or ""
+
 setup(
     name="flash_qla",
     version="0.1.0+blackwell" + rev,
     description="FlashQLA: Fused TileLang kernels for Linear Attention (Blackwell GB10 port)",
-    long_description=open(os.path.join(this_dir, "README.md")).read(),
+    long_description=_long_description,
     long_description_content_type="text/markdown",
     packages=find_packages(),
     license="MIT",
