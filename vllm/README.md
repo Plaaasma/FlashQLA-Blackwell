@@ -57,7 +57,9 @@ mods:
   - mods/flashqla
 ```
 
-A complete sample is in [`recipes/qwen3.6-27b-fp8-dflash.yaml`](recipes/qwen3.6-27b-fp8-dflash.yaml).
+A complete sample is in [`recipes/qwen3.6-27b-fp8-mtp2.yaml`](recipes/qwen3.6-27b-fp8-mtp2.yaml)
+— Qwen3.6-27B-FP8 with MTP-2 self-speculative decoding (lossless, no
+separate draft model required).
 Drop it in your `spark-vllm-docker/recipes/` and launch with your normal
 launcher script.
 

@@ -1,0 +1,85 @@
+# =====================================================================
+# Qwen3.6-27B-FP8 + MTP-2 (lossless self-spec) + FlashQLA — sample recipe
+# =====================================================================
+#
+# Sample spark-vllm-docker recipe demonstrating the FlashQLA mod on top
+# of Qwen3.6-27B-FP8 with MTP-2 self-speculative decoding.  Strip the
+# parts you don't need — the only line strictly required to enable
+# FlashQLA is `mods: - mods/flashqla`.
+#
+# Why MTP-2 instead of DFlash:
+#   - MTP self-drafts from the model's built-in MTP-1 head — no separate
+#     draft model to download or mount.
+#   - Lossless by construction: rejection sampling on every drafted
+#     token means outputs are bit-identical to non-spec decoding at
+#     the same temperature/seed.
+#   - num_speculative_tokens=2 is the empirical sweet spot.  MTP-3
+#     regressed -9% throughput in the 35B-A3B optimization pass
+#     because chained 3rd-position acceptance dropped sharply (errors
+#     compound).
+#
+# Stack:
+#   - Target:  Qwen3.6-27B-FP8 weights, bf16 compute.
+#   - Spec:    "mtp", num_speculative_tokens=2.
+#   - Backend: FLASH_ATTN (forces bf16 KV; FlashInfer + fp8 KV is
+#              materially slower on this hybrid linear+full attention
+#              model).
+#   - GDN:     FlashQLA TileLang fwd kernel (this mod).
+#
+# Sizing on GB10 (128 GB unified):
+#   - Target FP8 weights: ~29 GB.
+#   - max_model_len=65536 + gpu_memory_utilization=0.75 → ~91 GB pool,
+#     leaves ~30 GB system headroom for the desktop, TileLang JIT,
+#     and anything else you might run concurrently.  Bump to 262144 /
+#     0.85 if you need long context AND aren't running anything else.
+
+recipe_version: "1"
+name: Qwen3.6-27B-FP8-MTP2
+description: FP8 + MTP-2 self-spec + FlashQLA GDN, 64K ctx, bf16 KV
+solo_only: true
+container: vllm-node-tf5
+
+mods:
+  # FlashQLA TileLang GDN prefill kernel — replaces FLA Triton on the
+  # linear_attention layers with the Qwen team's fused fwd kernel.
+  # 2.76x kernel-level speedup vs FLA Triton at B=1, T=32768, Hv=64
+  # on GB10 (Stage A test).  End-to-end TTFT win is small (~3% on 8K
+  # prefill) because Qwen3.6-27B prefill is FA-dominated.  See the
+  # FlashQLA-Blackwell repo's docs/BENCHMARKS.md for details.
+  - mods/flashqla
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.75
+  max_model_len: 65536
+  max_num_batched_tokens: 16384
+  max_num_seqs: 8
+
+env:
+  HF_HUB_OFFLINE: "1"
+  VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+
+command: |
+  : > /tmp/vllm.log
+  exec > >(tee -a /tmp/vllm.log) 2>&1
+
+  exec python3 /vllm_compile_wrapper.py serve /models/qwen3.6-27b-fp8 \
+    --served-model-name qwen3.6-27b-fp8-mtp2 \
+    --host {host} \
+    --port {port} \
+    --dtype bfloat16 \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --load-format auto \
+    --trust-remote-code \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --enable-prefix-caching \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
+    -tp {tensor_parallel}
