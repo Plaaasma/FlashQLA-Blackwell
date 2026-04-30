@@ -61,6 +61,11 @@ env:
   HF_HUB_OFFLINE: "1"
   VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
   VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  # FlashInfer's sampler tends to bump spec-decode acceptance vs the
+  # default. z-lab's DFlash discussion #2 reports DFlash acceptance
+  # ~30% -> 35% with this on.  Same effect should apply to MTP.
+  # Easy to revert if it doesn't help on your workload.
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
 
 command: |
   : > /tmp/vllm.log

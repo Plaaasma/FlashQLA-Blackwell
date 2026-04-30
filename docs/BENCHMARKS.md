@@ -72,6 +72,61 @@ that ceiling either way.
   less.
 - **Pre-training / fine-tuning style runs** that batch large `T` per step.
 
+## Real-world tuning notes (Spark, dense 27B Qwen3.6)
+
+These aren't FlashQLA-specific but matter if you're trying to figure out why
+your wall-clock tok/s isn't matching forum claims. Surveyed against
+NVIDIA Spark forum threads, the spark-vllm-docker repo, z-lab DFlash
+discussions, and r/LocalLLaMA Spark/GB10 threads (2026-Q1 to 2026-Q2).
+
+**The bandwidth ceiling.** Spark's GB10 has 273 GB/s LPDDR5X unified memory.
+Decode on a dense 27B FP8 model is bandwidth-bound — 27 GB / 273 GB/s ≈ **10
+tok/s** without speculation. Spec decoding multiplies this by mean-acceptance
+length: DFlash-15 averages ~3.0 mean accept length and lands at ~25 tok/s
+single-stream on this model. That is at or above the public state of the art
+for FP8-dense 27B on a single Spark.
+
+**Constraint-safe knobs that are worth flipping** (each maybe +5-15%):
+
+- `VLLM_USE_FLASHINFER_SAMPLER=1` env var — bumps spec-decode acceptance by
+  a few percentage points on both DFlash and MTP. The sample recipe in
+  `vllm/recipes/` already has this.
+- `--max-num-seqs 4` (with `--max-num-batched-tokens 16384` or higher) for
+  pure single-stream benchmarking. Larger `max-num-seqs` doesn't *hurt*
+  single-user tok/s much in practice but the fastest published configs
+  uniformly use small batches.
+- `--enable-chunked-prefill` (default-on in recent vLLM, but harmless to
+  set explicitly).
+
+**Things that look like they should help but don't on dense 27B:**
+
+- `--kv-cache-dtype fp8`: no measured single-stream throughput gain on this
+  model and outputs diverged measurably on the related 35B-A3B (hybrid
+  linear+full attention seems to interact badly with fp8 KV scales).
+- `MTP-3` (or higher `num_speculative_tokens` for MTP): regresses vs MTP-2
+  because chained acceptance falls off fast.
+- `DFlash` `num_speculative_tokens > 15`: acceptance peaks 7-8 then degrades.
+- Prefix caching during single-stream micro-benchmarks: small acceptance hit
+  due to cache-aware scheduling, but you almost certainly want it on for
+  real workloads.
+- `TREE_ATTN` or `FLEX_ATTENTION` outside their intended use cases. TREE_ATTN
+  is required for DFlash's non-causal draft attention; FLEX has known
+  upstream stability issues on this model class.
+
+**Bigger levers that change the tradeoff:**
+
+| Path | Approx tok/s | Cost |
+|---|---:|---|
+| FP8 + DFlash-15 + FlashQLA (current best on dense 27B) | 25-30 | none beyond what's documented here |
+| **Switch to a sparse MoE** (e.g. Qwen3.6-35B-A3B with only ~3B active per token) | 40-50 | different model, but same family |
+| **INT4 weight quantization** (AutoRound, GPTQ) of dense 27B | 50-70 | accuracy degradation — worth measuring per-task before committing |
+| **MXFP4 / NVFP4 weight quantization** | 70-80+ | larger accuracy degradation; widely reported broken on certain Qwen3 variants |
+| **Add a second Spark** (TP=2) | 40-60 | hardware |
+
+If you're under all the same constraints (FP8+ weights, single Spark, no
+NVFP4/MXFP4), 25-30 tok/s is the realistic ceiling on dense 27B. Going above
+that means changing the model, the weight format, or the hardware.
+
 ## Reproducing
 
 ```bash
