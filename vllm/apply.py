@@ -185,6 +185,113 @@ INIT_NEW = '''    def __init__(self) -> None:
             self._forward_method = self.forward_native'''
 
 
+# V2 — matches upstream main as of 2026-05-04. Two drifts vs INIT_OLD:
+#  (a) backend_cfg fetch was split into 3 lines with an assert, and
+#  (b) `scope="local"` was removed from all logger.info_once() calls.
+# We emit a matching INIT_NEW_V2 that follows the same surrounding style.
+INIT_OLD_V2 = '''    def __init__(self) -> None:
+        super().__init__()
+        additional_config = get_current_vllm_config().additional_config
+        assert isinstance(additional_config, dict)
+        backend_cfg = additional_config.get("gdn_prefill_backend", "auto")
+        backend = str(backend_cfg).strip().lower()
+
+        supports_flashinfer = (
+            current_platform.is_cuda() and current_platform.is_device_capability(90)
+        )
+
+        if backend == "flashinfer":
+            use_flashinfer = supports_flashinfer
+            if not use_flashinfer:
+                logger.warning_once(
+                    "GDN prefill backend 'flashinfer' is selected but "
+                    "cannot use this kernel on the current platform. "
+                    "Falling back to Triton/FLA."
+                )
+        elif backend == "triton":
+            use_flashinfer = False
+        else:
+            use_flashinfer = supports_flashinfer
+
+        if use_flashinfer:
+            logger.info_once("Using FlashInfer GDN prefill kernel")
+            logger.info_once(
+                "FlashInfer GDN prefill kernel is JIT-compiled; first run may "
+                "take a while to compile. Set `--gdn-prefill-backend triton` to "
+                "avoid JIT compile time.",
+            )
+        else:
+            logger.info_once("Using Triton/FLA GDN prefill kernel")
+
+        self._forward_method = (
+            self.forward_cuda if use_flashinfer else self.forward_native
+        )'''
+
+INIT_NEW_V2 = '''    def __init__(self) -> None:
+        super().__init__()
+        additional_config = get_current_vllm_config().additional_config
+        assert isinstance(additional_config, dict)
+        backend_cfg = additional_config.get("gdn_prefill_backend", "auto")
+        backend = str(backend_cfg).strip().lower()
+
+        supports_flashinfer = (
+            current_platform.is_cuda() and current_platform.is_device_capability(90)
+        )
+        # ''' + SENTINEL + '''
+        # Blackwell consumer (sm_120/121, GB10): use FlashQLA TileLang kernel.
+        # is_device_capability(90) returns False on sm_12x because that helper
+        # checks for an exact major/minor (Hopper SM 9.0); we look at the major
+        # version directly to detect anything Blackwell-or-later.
+        try:
+            import torch as _torch
+            _major, _ = _torch.cuda.get_device_capability(0)
+            supports_flashqla = current_platform.is_cuda() and _major >= 10
+        except Exception:
+            supports_flashqla = False
+
+        if backend == "flashinfer":
+            use_flashinfer = supports_flashinfer
+            use_flashqla = False
+            if not use_flashinfer:
+                logger.warning_once(
+                    "GDN prefill backend 'flashinfer' is selected but "
+                    "cannot use this kernel on the current platform. "
+                    "Falling back to Triton/FLA."
+                )
+        elif backend == "triton":
+            use_flashinfer = False
+            use_flashqla = False
+        elif backend == "flashqla":
+            use_flashinfer = False
+            use_flashqla = supports_flashqla
+            if not use_flashqla:
+                logger.warning_once(
+                    "GDN prefill backend 'flashqla' is selected but "
+                    "the current GPU is pre-Blackwell. Falling back to Triton/FLA."
+                )
+        else:
+            # auto: prefer FlashQLA on Blackwell, FlashInfer on Hopper, else Triton.
+            use_flashqla = supports_flashqla
+            use_flashinfer = supports_flashinfer and not supports_flashqla
+
+        if use_flashqla:
+            logger.info_once(
+                "Using FlashQLA TileLang GDN prefill kernel (Blackwell)"
+            )
+            self._forward_method = self.forward_flashqla
+        elif use_flashinfer:
+            logger.info_once("Using FlashInfer GDN prefill kernel")
+            logger.info_once(
+                "FlashInfer GDN prefill kernel is JIT-compiled; first run may "
+                "take a while to compile. Set `--gdn-prefill-backend triton` to "
+                "avoid JIT compile time.",
+            )
+            self._forward_method = self.forward_cuda
+        else:
+            logger.info_once("Using Triton/FLA GDN prefill kernel")
+            self._forward_method = self.forward_native'''
+
+
 # Add the forward_flashqla method to ChunkGatedDeltaRule.  We insert it
 # right after the `def __init__` block, before `forward_cuda`.  The
 # parameter list mirrors forward_cuda's exactly (including chunk_indices /
@@ -269,18 +376,44 @@ def main() -> int:
         return 2
     src = src.replace(HELPER_ANCHOR, HELPER_BLOCK + HELPER_ANCHOR, 1)
 
-    for label, old, new in [
-        ("init_block", INIT_OLD, INIT_NEW),
-        ("forward_flashqla_method", METHOD_OLD, METHOD_NEW),
-    ]:
-        n = src.count(old)
-        if n != 1:
+    # Each label has one or more candidate (old, new) pairs — we try them
+    # in order and use the first one that matches exactly once.  This lets
+    # the patch survive small upstream drift (e.g. log-call signature
+    # changes, refactors of the backend-config fetch) without needing a
+    # new mod per vLLM release.
+    candidates = [
+        (
+            "init_block",
+            [
+                ("v1", INIT_OLD, INIT_NEW),
+                ("v2", INIT_OLD_V2, INIT_NEW_V2),
+            ],
+        ),
+        (
+            "forward_flashqla_method",
+            [
+                ("v1", METHOD_OLD, METHOD_NEW),
+            ],
+        ),
+    ]
+    for label, variants in candidates:
+        match_counts = []
+        applied = False
+        for variant_name, old, new in variants:
+            n = src.count(old)
+            match_counts.append(f"{variant_name}={n}")
+            if n == 1:
+                src = src.replace(old, new, 1)
+                print(f"[OK] applied {label} ({variant_name})")
+                applied = True
+                break
+        if not applied:
             print(
-                f"ERROR: pattern '{label}' expected 1 match, found {n} in {GDN.name}",
+                f"ERROR: no variant of '{label}' matched in {GDN.name} "
+                f"(tried: {', '.join(match_counts)})",
                 file=sys.stderr,
             )
             return 2
-        src = src.replace(old, new, 1)
 
     GDN.write_text(src)
     print(f"[OK] patched {GDN.name}")
