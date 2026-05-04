@@ -132,13 +132,24 @@ INIT_NEW = '''    def __init__(self) -> None:
         # Blackwell consumer (sm_120/121, GB10): use FlashQLA TileLang kernel.
         # is_device_capability(90) returns False on sm_12x because that helper
         # checks for an exact major/minor (Hopper SM 9.0); we look at the major
-        # version directly to detect anything Blackwell-or-later.
+        # version directly to detect anything Blackwell-or-later.  We ALSO
+        # require that `flash_qla` is importable — without it the forward
+        # method would crash at warmup time.  The mod's run.sh installs the
+        # wheel, but if someone applies this patch by other means (manual
+        # apply.py invocation, copying files, etc.) the wheel may be missing.
         try:
             import torch as _torch
             _major, _ = _torch.cuda.get_device_capability(0)
-            supports_flashqla = current_platform.is_cuda() and _major >= 10
+            _has_blackwell = current_platform.is_cuda() and _major >= 10
         except Exception:
-            supports_flashqla = False
+            _has_blackwell = False
+        try:
+            import importlib as _importlib
+            _importlib.import_module("flash_qla")
+            _has_flashqla_module = True
+        except ImportError:
+            _has_flashqla_module = False
+        supports_flashqla = _has_blackwell and _has_flashqla_module
 
         if backend == "flashinfer":
             use_flashinfer = supports_flashinfer
@@ -156,14 +167,29 @@ INIT_NEW = '''    def __init__(self) -> None:
             use_flashinfer = False
             use_flashqla = supports_flashqla
             if not use_flashqla:
-                logger.warning_once(
-                    "GDN prefill backend 'flashqla' is selected but "
-                    "the current GPU is pre-Blackwell. Falling back to Triton/FLA."
-                )
+                if not _has_blackwell:
+                    logger.warning_once(
+                        "GDN prefill backend 'flashqla' is selected but "
+                        "the current GPU is pre-Blackwell. Falling back to "
+                        "Triton/FLA."
+                    )
+                else:
+                    logger.warning_once(
+                        "GDN prefill backend 'flashqla' is selected but "
+                        "the `flash_qla` module is not installed. Falling "
+                        "back to Triton/FLA. Install via the flashqla mod "
+                        "or `pip install flash_qla`."
+                    )
         else:
             # auto: prefer FlashQLA on Blackwell, FlashInfer on Hopper, else Triton.
             use_flashqla = supports_flashqla
             use_flashinfer = supports_flashinfer and not supports_flashqla
+            if _has_blackwell and not _has_flashqla_module:
+                logger.warning_once(
+                    "FlashQLA patch is present but `flash_qla` module is "
+                    "not installed; falling back to Triton/FLA. Install "
+                    "via the flashqla mod or `pip install flash_qla`."
+                )
 
         if use_flashqla:
             logger.info_once(
@@ -239,15 +265,20 @@ INIT_NEW_V2 = '''    def __init__(self) -> None:
         )
         # ''' + SENTINEL + '''
         # Blackwell consumer (sm_120/121, GB10): use FlashQLA TileLang kernel.
-        # is_device_capability(90) returns False on sm_12x because that helper
-        # checks for an exact major/minor (Hopper SM 9.0); we look at the major
-        # version directly to detect anything Blackwell-or-later.
+        # See INIT_NEW above for the rationale on the GPU + module checks.
         try:
             import torch as _torch
             _major, _ = _torch.cuda.get_device_capability(0)
-            supports_flashqla = current_platform.is_cuda() and _major >= 10
+            _has_blackwell = current_platform.is_cuda() and _major >= 10
         except Exception:
-            supports_flashqla = False
+            _has_blackwell = False
+        try:
+            import importlib as _importlib
+            _importlib.import_module("flash_qla")
+            _has_flashqla_module = True
+        except ImportError:
+            _has_flashqla_module = False
+        supports_flashqla = _has_blackwell and _has_flashqla_module
 
         if backend == "flashinfer":
             use_flashinfer = supports_flashinfer
@@ -265,14 +296,29 @@ INIT_NEW_V2 = '''    def __init__(self) -> None:
             use_flashinfer = False
             use_flashqla = supports_flashqla
             if not use_flashqla:
-                logger.warning_once(
-                    "GDN prefill backend 'flashqla' is selected but "
-                    "the current GPU is pre-Blackwell. Falling back to Triton/FLA."
-                )
+                if not _has_blackwell:
+                    logger.warning_once(
+                        "GDN prefill backend 'flashqla' is selected but "
+                        "the current GPU is pre-Blackwell. Falling back to "
+                        "Triton/FLA."
+                    )
+                else:
+                    logger.warning_once(
+                        "GDN prefill backend 'flashqla' is selected but "
+                        "the `flash_qla` module is not installed. Falling "
+                        "back to Triton/FLA. Install via the flashqla mod "
+                        "or `pip install flash_qla`."
+                    )
         else:
             # auto: prefer FlashQLA on Blackwell, FlashInfer on Hopper, else Triton.
             use_flashqla = supports_flashqla
             use_flashinfer = supports_flashinfer and not supports_flashqla
+            if _has_blackwell and not _has_flashqla_module:
+                logger.warning_once(
+                    "FlashQLA patch is present but `flash_qla` module is "
+                    "not installed; falling back to Triton/FLA. Install "
+                    "via the flashqla mod or `pip install flash_qla`."
+                )
 
         if use_flashqla:
             logger.info_once(
