@@ -60,6 +60,25 @@ else
     echo "[flashqla] flash_qla already installed; skipping pip"
 fi
 
+# Disable tilelang's bundled libcudart_stub.so.  Tilelang ships a stub
+# CUDA Runtime library for build-time linking; at runtime, depending on
+# how the dynamic loader resolves "libcudart.so", flashinfer's
+# `ctypes.CDLL("libcudart.so")` (in flashinfer/comm/cuda_ipc.py) can
+# pick up the stub instead of the real /usr/local/cuda libcudart.  When
+# that happens, the very next attribute lookup
+# (e.g. `cudaDeviceReset`) raises:
+#   AttributeError: .../tilelang/lib/libcudart_stub.so:
+#                   undefined symbol: cudaDeviceReset
+# which crashes the EngineCore at compilation-backend init time, before
+# any model load. Renaming the stub forces the loader to find the real
+# libcudart.  Tilelang itself doesn't need the stub at runtime — it
+# uses the system CUDA Runtime when actually executing kernels.
+TILELANG_STUB="$(python3 -c 'import os, tilelang; print(os.path.join(os.path.dirname(tilelang.__file__), "lib", "libcudart_stub.so"))' 2>/dev/null || true)"
+if [[ -n "$TILELANG_STUB" && -f "$TILELANG_STUB" ]]; then
+    mv "$TILELANG_STUB" "${TILELANG_STUB}.disabled"
+    echo "[flashqla] disabled tilelang libcudart stub: $TILELANG_STUB"
+fi
+
 # Patch gdn_linear_attn.py
 python3 "$SCRIPT_DIR/apply.py"
 
