@@ -402,6 +402,68 @@ METHOD_NEW = '''    def forward_flashqla(
         return fi_chunk_gated_delta_rule('''
 
 
+# V2 - matches upstream as of 5/12/2026 (vllm commit 8f89381)
+METHOD_OLD_V2 = '''    def forward_cuda(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+    ):
+        o, final_state = fi_chunk_gated_delta_rule('''
+
+METHOD_NEW_V2 = '''    def forward_flashqla(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+    ):  # ''' + SENTINEL + '''
+        return _flashqla_chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+
+    def forward_cuda(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+    ):
+        o, final_state = fi_chunk_gated_delta_rule('''
+
+
 def main() -> int:
     if not GDN.exists():
         print(f"ERROR: missing {GDN}", file=sys.stderr)
@@ -439,6 +501,7 @@ def main() -> int:
             "forward_flashqla_method",
             [
                 ("v1", METHOD_OLD, METHOD_NEW),
+                ("v2", METHOD_OLD_V2, METHOD_NEW_V2),
             ],
         ),
     ]
