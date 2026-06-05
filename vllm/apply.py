@@ -26,7 +26,17 @@ import sys
 from pathlib import Path
 
 VLLM_ROOT = Path("/usr/local/lib/python3.12/dist-packages/vllm")
-GDN = VLLM_ROOT / "model_executor/layers/mamba/gdn_linear_attn.py"
+# vLLM moved the ChunkGatedDeltaRule CustomOp around between releases:
+#   - <= 0.19:  model_executor/layers/mamba/gdn_linear_attn.py
+#   - >= 0.20:  model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+#               (the GDN code was split into a gdn/ subpackage per model
+#               family: base.py, qwen_gdn_linear_attn.py, kimi_*, olmo_*).
+# We try each known location and patch the first one that actually defines
+# the chunk_gated_delta_rule CustomOp (detected via HELPER_ANCHOR below).
+GDN_CANDIDATES = [
+    VLLM_ROOT / "model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+    VLLM_ROOT / "model_executor/layers/mamba/gdn_linear_attn.py",
+]
 SENTINEL = "# [FLASHQLA PATCH]"
 
 
@@ -338,6 +348,114 @@ INIT_NEW_V2 = '''    def __init__(self) -> None:
             self._forward_method = self.forward_native'''
 
 
+# V3 — matches vLLM >= 0.20, where the backend-selection logic was
+# extracted into the module-level `_resolve_gdn_prefill_backend()` helper
+# and the class __init__ shrank to: resolve -> log -> dispatch.  A third
+# backend ("cutedsl") and a forward_cutedsl method were also added.  We
+# wrap the dispatch tail so flashqla wins on Blackwell without touching
+# the upstream resolver.
+INIT_OLD_V3 = '''    def __init__(self) -> None:
+        super().__init__()
+        vllm_config = get_current_vllm_config()
+        backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
+        self.gdn_prefill_backend = active_backend
+
+        if backend in ("flashinfer", "cutedsl") and active_backend != backend:
+            logger.warning_once(
+                "GDN prefill backend '%s' is selected but cannot use this "
+                "kernel on the current platform. Falling back to Triton/FLA.",
+                backend,
+            )
+        _log_gdn_backend_decision(vllm_config, backend, active_backend)
+
+        if active_backend == "flashinfer":
+            self._forward_method = self.forward_cuda
+        elif active_backend == "cutedsl":
+            self._forward_method = self.forward_cutedsl
+        else:
+            self._forward_method = self.forward_native'''
+
+INIT_NEW_V3 = '''    def __init__(self) -> None:
+        super().__init__()
+        vllm_config = get_current_vllm_config()
+        backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
+        self.gdn_prefill_backend = active_backend
+
+        if backend in ("flashinfer", "cutedsl") and active_backend != backend:
+            logger.warning_once(
+                "GDN prefill backend '%s' is selected but cannot use this "
+                "kernel on the current platform. Falling back to Triton/FLA.",
+                backend,
+            )
+        _log_gdn_backend_decision(vllm_config, backend, active_backend)
+        # ''' + SENTINEL + '''
+        # Blackwell consumer (sm_120/121, GB10): prefer the FlashQLA TileLang
+        # kernel.  `_resolve_gdn_prefill_backend` doesn't know about flashqla
+        # (it returns one of triton/flashinfer/cutedsl), so we detect Blackwell
+        # + an importable flash_qla here and override the dispatch.  `backend`
+        # is the *requested* string, so an explicit `gdn_prefill_backend:
+        # flashqla` shows up here even though the resolver mapped it to triton.
+        # See INIT_NEW (v1) for the rationale on the GPU + module checks.
+        try:
+            import torch as _torch
+            _major, _ = _torch.cuda.get_device_capability(0)
+            _has_blackwell = current_platform.is_cuda() and _major >= 10
+        except Exception:
+            _has_blackwell = False
+        try:
+            import importlib as _importlib
+            _importlib.import_module("flash_qla")
+            _has_flashqla_module = True
+        except ImportError:
+            _has_flashqla_module = False
+        _supports_flashqla = _has_blackwell and _has_flashqla_module
+
+        if backend == "flashqla":
+            _use_flashqla = _supports_flashqla
+            if not _use_flashqla:
+                if not _has_blackwell:
+                    logger.warning_once(
+                        "GDN prefill backend 'flashqla' is selected but the "
+                        "current GPU is pre-Blackwell. Falling back to the "
+                        "resolved backend '%s'.",
+                        active_backend,
+                    )
+                else:
+                    logger.warning_once(
+                        "GDN prefill backend 'flashqla' is selected but the "
+                        "`flash_qla` module is not installed. Falling back to "
+                        "the resolved backend '%s'. Install via the flashqla "
+                        "mod or `pip install flash_qla`.",
+                        active_backend,
+                    )
+        elif backend == "auto":
+            # auto: prefer FlashQLA on Blackwell over flashinfer/cutedsl/triton.
+            _use_flashqla = _supports_flashqla
+            if _has_blackwell and not _has_flashqla_module:
+                logger.warning_once(
+                    "FlashQLA patch is present but `flash_qla` module is not "
+                    "installed; using the resolved backend '%s' instead. "
+                    "Install via the flashqla mod or `pip install flash_qla`.",
+                    active_backend,
+                )
+        else:
+            # An explicit triton/flashinfer/cutedsl request is honoured as-is.
+            _use_flashqla = False
+
+        if _use_flashqla:
+            logger.info_once(
+                "Using FlashQLA TileLang GDN prefill kernel (Blackwell)"
+            )
+            self.gdn_prefill_backend = "flashqla"
+            self._forward_method = self.forward_flashqla
+        elif active_backend == "flashinfer":
+            self._forward_method = self.forward_cuda
+        elif active_backend == "cutedsl":
+            self._forward_method = self.forward_cutedsl
+        else:
+            self._forward_method = self.forward_native'''
+
+
 # Add the forward_flashqla method to ChunkGatedDeltaRule.  We insert it
 # right after the `def __init__` block, before `forward_cuda`.  The
 # parameter list mirrors forward_cuda's exactly (including chunk_indices /
@@ -433,8 +551,9 @@ METHOD_NEW_V2 = '''    def forward_flashqla(
         chunk_indices: torch.Tensor | None = None,
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
     ):  # ''' + SENTINEL + '''
-        return _flashqla_chunk_gated_delta_rule(
+        o, final_state = _flashqla_chunk_gated_delta_rule(
             q=q,
             k=k,
             v=v,
@@ -445,6 +564,14 @@ METHOD_NEW_V2 = '''    def forward_flashqla(
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
+        # Mirror forward_cuda: if the caller passed a preallocated output
+        # buffer, copy our result into it (current call sites use the return
+        # value and leave this None, but match the signature for parity).
+        if core_attn_out is not None:
+            o_flat = o.squeeze(0).reshape(-1)
+            co_flat = core_attn_out.reshape(-1)
+            co_flat[: o_flat.numel()].copy_(o_flat)
+        return o, final_state
 
     def forward_cuda(
         self,
@@ -465,19 +592,37 @@ METHOD_NEW_V2 = '''    def forward_flashqla(
 
 
 def main() -> int:
-    if not GDN.exists():
-        print(f"ERROR: missing {GDN}", file=sys.stderr)
+    # Locate the file that defines the chunk_gated_delta_rule CustomOp.
+    # Across vLLM releases it lives at different paths (see GDN_CANDIDATES);
+    # pick the first existing candidate that actually contains the anchor.
+    existing = [p for p in GDN_CANDIDATES if p.exists()]
+    if not existing:
+        print(
+            "ERROR: no GDN file found. Tried:\n  "
+            + "\n  ".join(str(p) for p in GDN_CANDIDATES),
+            file=sys.stderr,
+        )
         return 1
 
-    src = GDN.read_text()
+    gdn = None
+    for p in existing:
+        if HELPER_ANCHOR in p.read_text():
+            gdn = p
+            break
+    if gdn is None:
+        # Fall back to the first existing file so the anchor error below
+        # reports against a real path rather than silently bailing.
+        gdn = existing[0]
+
+    src = gdn.read_text()
     if SENTINEL in src:
-        print(f"[OK] {GDN.name} already patched")
+        print(f"[OK] {gdn.name} already patched")
         return 0
 
     # Insert helper just before the @CustomOp.register decorator.
     if src.count(HELPER_ANCHOR) != 1:
         print(
-            f"ERROR: helper anchor not found in {GDN.name} "
+            f"ERROR: helper anchor not found in {gdn} "
             f"(expected 1 occurrence of '@CustomOp.register(\"chunk_gated_delta_rule\")')",
             file=sys.stderr,
         )
@@ -486,15 +631,17 @@ def main() -> int:
 
     # Each label has one or more candidate (old, new) pairs — we try them
     # in order and use the first one that matches exactly once.  This lets
-    # the patch survive small upstream drift (e.g. log-call signature
-    # changes, refactors of the backend-config fetch) without needing a
-    # new mod per vLLM release.
+    # the patch survive upstream drift (log-call signature changes, backend
+    # resolver refactors, the gdn/ subpackage split) without needing a new
+    # mod per vLLM release.  Newer variants are listed last; order among
+    # them doesn't matter since at most one matches a given source file.
     candidates = [
         (
             "init_block",
             [
                 ("v1", INIT_OLD, INIT_NEW),
                 ("v2", INIT_OLD_V2, INIT_NEW_V2),
+                ("v3", INIT_OLD_V3, INIT_NEW_V3),
             ],
         ),
         (
@@ -518,14 +665,14 @@ def main() -> int:
                 break
         if not applied:
             print(
-                f"ERROR: no variant of '{label}' matched in {GDN.name} "
+                f"ERROR: no variant of '{label}' matched in {gdn} "
                 f"(tried: {', '.join(match_counts)})",
                 file=sys.stderr,
             )
             return 2
 
-    GDN.write_text(src)
-    print(f"[OK] patched {GDN.name}")
+    gdn.write_text(src)
+    print(f"[OK] patched {gdn}")
     return 0
 
 
